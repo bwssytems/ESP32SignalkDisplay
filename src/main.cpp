@@ -75,7 +75,7 @@ FS *filesystem = &FFat;
 #include <SPIFFSEditor.h>
 
 // SSID and PW for Config Portal
-String ssid = "SignalkDisplayWifi_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+String ssid = "SK_DisplayWifi_" + String((uint32_t)ESP.getEfuseMac(), HEX);
 String password;
 
 // SSID and PW for your Router
