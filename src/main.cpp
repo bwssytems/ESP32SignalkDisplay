@@ -395,6 +395,7 @@ void signalkWebSocketEvent(WStype_t type, uint8_t *payload, size_t length)
   case WStype_TEXT:
     // USE_SERIAL.printf("[WSc] received payload: %s\n", payload);
     counter++;
+    signalk_read_bytes = signalk_read_bytes + length;
     DeserializationError err = deserializeJson(signalkData, payload);
 
     if (err.code() == DeserializationError::Ok)
