@@ -5,11 +5,13 @@
 #endif
 
 #include <WiFi.h>
+#include <Update.h>
 #include <WiFiClient.h>
 #include <WiFiMulti.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
+#include <ESPmDNS.h>
 
 #define ESP_ASYNC_WIFIMANAGER_VERSION_MIN_TARGET "ESPAsync_WiFiManager v1.9.2"
 
@@ -84,7 +86,9 @@ String host = String(ssid);
 #define HTTP_PORT 80
 
 AsyncWebServer server(HTTP_PORT);
-//DNSServer dnsServer;
+// DNSServer dnsServer;
+size_t content_len;
+int previousProgress;
 
 AsyncEventSource events("/events");
 
@@ -92,6 +96,44 @@ String http_username = "admin";
 String http_password = "admin";
 
 String separatorLine = "===============================================================";
+
+const char* serverIndex = 
+"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
+"<h2>OTA bin file selection</h2>"
+"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
+   "<input type='file' name='update'>"
+        "<input type='submit' value='Update'>"
+    "</form>"
+ "<div id='prg'>progress: 0%</div>"
+ "<script>"
+  "$('form').submit(function(e){"
+  "e.preventDefault();"
+  "var form = $('#upload_form')[0];"
+  "var data = new FormData(form);"
+  " $.ajax({"
+  "url: '/update',"
+  "type: 'POST',"
+  "data: data,"
+  "contentType: false,"
+  "processData:false,"
+  "xhr: function() {"
+  "var xhr = new window.XMLHttpRequest();"
+  "xhr.upload.addEventListener('progress', function(evt) {"
+  "if (evt.lengthComputable) {"
+  "var per = evt.loaded / evt.total;"
+  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
+  "}"
+  "}, false);"
+  "return xhr;"
+  "},"
+  "success:function(d, s) {"
+  "console.log('success!')" 
+ "},"
+ "error: function (a, b, c) {"
+ "}"
+ "});"
+ "});"
+ "</script>";
 
 uint8_t connectMultiWiFi()
 {
@@ -142,7 +184,7 @@ uint8_t connectMultiWiFi()
   return status;
 }
 
-//format bytes
+// format bytes
 String formatBytes(size_t bytes)
 {
   if (bytes < 1024)
@@ -165,7 +207,7 @@ String formatBytes(size_t bytes)
 
 void toggleLED()
 {
-  //toggle state
+  // toggle state
 #ifdef M5STICK
   if (toggleM5color)
   {
@@ -429,27 +471,27 @@ void signalkWebSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       new_depth = new_depth * METER_CONVERSION;
     }
 
-      // Test Alarm by making the depth lower
-      /*
-      if (counter % 20 == 0 || counter % 21 == 0 || counter % 22 == 0)
-      {
-        new_depth = 2.8F;
-      }
-      */
+    // Test Alarm by making the depth lower
+    /*
+    if (counter % 20 == 0 || counter % 21 == 0 || counter % 22 == 0)
+    {
+      new_depth = 2.8F;
+    }
+    */
     _depth = String(new_depth, 2);
 
     if (new_depth != prev_depth)
     {
-      USE_SERIAL.printf("[WSc] display depth changed: %s%s - ", _depth.c_str(), _depth_unit_disp.c_str());
+      USE_SERIAL.printf("[WSc] display depth changed: %s%s - msgs #%d - changed #%d\n", _depth.c_str(), _depth_unit_disp.c_str(), counter, change_counter);
       change_counter++;
       displayDepth(new_depth);
     }
     else
     {
-      USE_SERIAL.printf("[WSc] depth not changed: %s%s - ", _depth.c_str(), _depth_unit_disp.c_str());
+      // USE_SERIAL.printf("[WSc] depth not changed: %s%s - ", _depth.c_str(), _depth_unit_disp.c_str());
     }
 
-    USE_SERIAL.printf("counters: msgs #%d - changed #%d\n", counter, change_counter);
+    // USE_SERIAL.printf("counters: msgs #%d - changed #%d\n", counter, change_counter);
     prev_depth = new_depth;
     _prev_depth = _depth;
     break;
@@ -458,14 +500,14 @@ void signalkWebSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
 bool restartRequested = false;
 
-//flag for saving data
+// flag for saving data
 bool shouldSaveConfig = false;
 
 int _timeStampMillis;
 char _timeString[26];
 String formatDateNow();
 
-//callback notifying us of the need to save config
+// callback notifying us of the need to save config
 void saveConfigCallback()
 {
   Serial.println("Should save config");
@@ -594,6 +636,7 @@ void handleRoot(AsyncWebServerRequest *request)
   message += String("</form><br>");
   message += String("<form action=\"/get\">");
   message += String("</form><br>");
+  message += String("<p><a href=\"/ota\"><button class=\"button button2\">OTA</button></a></p>");
   message += String("<p><a href=\"/resetbytes\"><button class=\"button button2\">Reset Byte Counter</button></a></p>");
   message += String("<p><a href=\"/restartunit\"><button class=\"button button2\">Restart Device</button></a></p>");
   message += String("<p><a href=\"/resetunit\"><button class=\"button button2\">Reset Device</button></a></p>");
@@ -601,6 +644,76 @@ void handleRoot(AsyncWebServerRequest *request)
   AsyncResponseStream *response = request->beginResponseStream("text/html");
   response->print(message.c_str());
   request->send(response);
+}
+
+void handleOTA(AsyncWebServerRequest *request)
+{
+  String message = createHttpContentStart();
+  message += String(serverIndex);
+  message += createHttpContentEnd();
+  AsyncResponseStream *response = request->beginResponseStream("text/html");
+  response->print(message.c_str());
+  request->send(response);
+}
+
+void printProgress(size_t prg, size_t sz)
+{
+  int currentProgress = (prg * 100) / content_len;
+  if(currentProgress >= (previousProgress + 5) || (currentProgress == 1 && previousProgress == 0) || (currentProgress >= 99 && previousProgress < 99)) {
+    Serial.printf("Progress: %d%%\n", currentProgress);
+    if(currentProgress > 1) {
+      previousProgress = currentProgress;
+    }
+  }
+}
+
+void handleUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
+{
+  if (!index)
+  {
+    previousProgress = 0;
+    content_len = request->contentLength();
+    int cmd = (filename.indexOf("spiffs") > -1) ? U_SPIFFS : U_FLASH;
+    Serial.printf("Update: %s\n", filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd))
+    { // start with max available size
+      Update.printError(Serial);
+    }
+  }
+
+  /* flashing firmware to ESP*/
+  if (Update.write(data, len) != len)
+  {
+    Update.printError(Serial);
+  }
+
+  if (final)
+  {
+    String message = createHttpContentStart();
+    message += String("<script>window.location.href = \"http://") + WiFi.localIP().toString() + String("/\"</script>");
+    message += "Update Success - Please wait while the device reboots";
+    message += createHttpContentEnd();
+    AsyncWebServerResponse *response = request->beginResponse(200, "text/html", message);
+    request->send(response);
+    delay(10);
+    if (Update.end(true))
+    { // true to set the size to the current progress
+      Serial.printf("Progress: 100%%\n");
+      Serial.printf("Update Success \nRebooting...\n");
+      Serial.flush();
+      ESP.restart();
+    }
+    else
+    {
+      Update.printError(Serial);
+    }
+  }
+}
+
+void handleUploadError(AsyncWebServerRequest *request)
+{
+  request->send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+  ESP.restart();
 }
 
 void handleGet(AsyncWebServerRequest *request)
@@ -631,7 +744,7 @@ void handleGet(AsyncWebServerRequest *request)
     {
       dataChanged = true;
       alarm_depth = new_alarm;
-      if(alarm_depth < 0.5F)
+      if (alarm_depth < 0.5F)
       {
         alarm_depth = 0.5F;
       }
@@ -764,7 +877,7 @@ void setup()
   // USE_SERIAL.begin(921600);
   USE_SERIAL.begin(115200);
 
-  //Serial.setDebugOutput(true);
+  // Serial.setDebugOutput(true);
   USE_SERIAL.setDebugOutput(true);
 
   USE_SERIAL.println();
@@ -778,7 +891,7 @@ void setup()
     delay(1000);
   }
 
-//set led pin as output
+// set led pin as output
 #ifndef M5STICK
   pinMode(LED_BUILTIN, OUTPUT);
 #endif
@@ -930,8 +1043,8 @@ void setup()
     }
   }
   Serial.println();
-  //end read
-  // FileFS.end();
+  // end read
+  //  FileFS.end();
 
 #ifdef M5STICK
   M5.dis.drawpix(0, 0xabfe00); // orange
@@ -962,7 +1075,7 @@ void setup()
   Router_SSID = ESPAsync_wifiManager.WiFi_SSID();
   Router_Pass = ESPAsync_wifiManager.WiFi_Pass();
 
-  //Remove this line if you do not want to see WiFi password printed
+  // Remove this line if you do not want to see WiFi password printed
   Serial.println("ESP Self-Stored: SSID = " + Router_SSID + ", Pass = " + Router_Pass);
 
   // SSID to uppercase
@@ -984,7 +1097,18 @@ void setup()
     connectMultiWiFi();
   }
 
-  //SERVER INIT
+  /*use mdns for host name resolution*/
+  if (!MDNS.begin(ssid.c_str()))
+  {
+    Serial.println("Error setting up MDNS responder!");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+  Serial.println("mDNS responder started");
+
+  // SERVER INIT
   events.onConnect([](AsyncEventSourceClient *client)
                    { client->send("hello!", NULL, millis(), 1000); });
 
@@ -996,12 +1120,20 @@ void setup()
   server.addHandler(new SPIFFSEditor(FileFS, http_username, http_password));
 
   server.on("/", handleRoot);
+  server.on("/ota", handleOTA);
+  server.on(
+      "/update", HTTP_POST,
+      [](AsyncWebServerRequest *request) {},
+      [](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data,
+         size_t len, bool final)
+      { handleUpload(request, filename, index, data, len, final); });
   server.on("/resetbytes", handleResetBytes);
   server.on("/restartunit", handleRestartUnit);
   server.on("/resetunit", handleResetUnit);
   server.on("/get", handleGet);
   server.onNotFound(handleNotFound);
   server.begin();
+  Update.onProgress(printProgress);
   Serial.print(F("HTTP server started @ "));
   Serial.println(WiFi.localIP().toString());
 
@@ -1188,6 +1320,5 @@ void displayDepth(float theDepth)
   }
 
   TFT_DrawDepth(theDepth, prev_alarm);
-  
 }
 #endif
